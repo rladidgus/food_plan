@@ -9,6 +9,7 @@ from sqlalchemy import and_
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.food_lens import decide_food_gpt_only
@@ -18,7 +19,18 @@ from app import models
 from typing import List, Optional
 from app.inbody_ocr import extract_key_values, format_key_values, upstage_ocr_from_bytes, update_user_inbody, build_demo
 from app.inbody import InbodyInput, BodyTypeResult, classify_body_type
-from fastapi.staticfiles import StaticFiles
+from supabase import create_client, Client
+
+# Supabase 클라이언트 초기화
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_URL / SUPABASE_KEY 환경변수가 필요합니다.")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+security = HTTPBearer()
+
 
 UPLOAD_DIR = Path("uploads/foods")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -183,14 +195,86 @@ def login(user_data: UserLogin, db: Session = Depends(get_db)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="아이디 또는 비밀번호가 올바르지 않습니다."
         )
-    
     return {
         "user_number": user.user_number,
         "id": user.id,
         "username": user.username,
         "message": "로그인 성공"
     }
-def create_diet_record(request: DietRecordRequest, db: Session = Depends(get_db)):
+
+async def get_current_user_from_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    """
+    Supabase 토큰을 검증하고 해당하는 로컬 DB 사용자를 반환
+    (없으면 자동 회원가입)
+    """
+    token = credentials.credentials
+    
+    try:
+        # 1. Supabase에 토큰 검증 요청
+        user_response = supabase.auth.get_user(token)
+        user_data = user_response.user
+        
+        if not user_data:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="유효하지 않은 토큰입니다.")
+        
+        # 2. 로컬 DB에서 사용자 조회
+        # social_id (uid)로 조회
+        provider_user_id = user_data.id
+        email = user_data.email
+        
+        existing_user = db.query(User).filter(User.provider_user_id == provider_user_id).first()
+        
+        if existing_user:
+            return existing_user
+            
+        # 3. 없으면 자동 회원가입 진행
+        # ID는 이메일이나 난수로 생성, 비밀번호는 사용 안 함(Dummy)
+        new_username = user_data.user_metadata.get("full_name") or user_data.user_metadata.get("name") or email.split("@")[0]
+        
+        new_user = User(
+            id=email, # 소셜 로그인은 이메일을 ID로 사용하거나 UUID 사용
+            username=new_username,
+            password=uuid4().hex, # 비밀번호는 랜덤으로 설정 (로그인에 사용 안 함)
+            provider_user_id=provider_user_id,
+            email=email,
+            role="user"
+        )
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+        
+        # 프로필도 함께 생성
+        new_profile = UserProfile(
+            user_number=new_user.user_number
+        )
+        db.add(new_profile)
+        db.commit()
+        
+        return new_user
+        
+    except Exception as e:
+        print(f"Token verification failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="인증에 실패했습니다."
+        )
+
+@app.get("/api/me", response_model=AuthResponse)
+def read_users_me(current_user: User = Depends(get_current_user_from_token)):
+    """
+    현재 로그인된(토큰) 사용자 정보 조회
+    """
+    return {
+        "user_number": current_user.user_number,
+        "id": current_user.id,
+        "username": current_user.username,
+        "message": "사용자 정보를 성공적으로 불러왔습니다."
+    }
+@app.post("/api/diet-record")
+def create_diet_record(request: DietRecordRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user_from_token)):
     """
     칼로리에 기반한 식단 기록 생성
     """
@@ -212,7 +296,7 @@ def create_diet_record(request: DietRecordRequest, db: Session = Depends(get_db)
     
     # DB에 식단 기록 저장 (목표 칼로리 포함)
     record = Record(
-        user_number=1,  # TODO: 실제 로그인한 사용자 ID 사용
+        user_number=current_user.user_number,  # TODO: 실제 로그인한 사용자 ID 사용
         goal_calories=goal,
         food_name=food_name,
         food_calories=calories,
